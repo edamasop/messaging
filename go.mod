@@ -1,4 +1,4 @@
-module messaging
+module github.com/edamasop/messaging
 
 go 1.26
 
