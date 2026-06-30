@@ -56,7 +56,7 @@ type ConsumerConfig struct {
 type KafkaConsumer struct {
 	config    ConsumerConfig
 	consumer  *kafka.Reader
-	handlers  map[string]EventHandler
+	handlers  map[string][]EventHandler
 	logger    *log.Logger
 	errLogger *log.Logger
 
@@ -154,7 +154,7 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 	return &KafkaConsumer{
 		config:     cfg,
 		consumer:   kafka.NewReader(readerCfg),
-		handlers:   make(map[string]EventHandler),
+		handlers:   make(map[string][]EventHandler),
 		logger:     log.New(cfg.LogOutput, "[KAFKA_CONSUMER] INFO: ", log.LstdFlags),
 		errLogger:  log.New(cfg.ErrOutput, "[KAFKA_CONSUMER] ERROR: ", log.LstdFlags),
 		shutdownCh: make(chan struct{}),
@@ -174,8 +174,14 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 func (c *KafkaConsumer) RegisterHandler(eventType string, handler EventHandler) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.handlers[eventType] = handler
-	c.logInfo("Registered handler for event type: %s", eventType)
+
+	c.handlers[eventType] = append(c.handlers[eventType], handler)
+
+	c.logInfo(
+		"Registered handler #%d for event type: %s",
+		len(c.handlers[eventType]),
+		eventType,
+	)
 }
 
 func (c *KafkaConsumer) Start(ctx context.Context) {
@@ -358,8 +364,12 @@ func (c *KafkaConsumer) GetMetrics() ConsumerMetrics {
 func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	startTime := time.Now()
 
-	c.logInfo("Received message from topic %s, partition %d, offset %d",
-		msg.Topic, msg.Partition, msg.Offset)
+	c.logInfo(
+		"Received message from topic %s, partition %d, offset %d",
+		msg.Topic,
+		msg.Partition,
+		msg.Offset,
+	)
 
 	var event Event
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
@@ -367,80 +377,98 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 		c.metrics.recordError(err)
 
 		if c.config.EnableDLQ {
-			// Preserve the raw bytes since `event` is zero-valued here --
-			// previously this sent an empty Event to the DLQ, losing the
-			// only copy of the bad payload.
 			c.sendToDLQ(rawEventFallback(msg.Value), err, 0, msg.Value)
 		}
+
 		c.commitIfManual(ctx, msg)
 		return
 	}
 
 	c.mu.RLock()
-	handler, ok := c.handlers[event.Type]
+	handlers := append([]EventHandler(nil), c.handlers[event.Type]...)
 	c.mu.RUnlock()
 
-	if !ok {
-		err := errors.New("no handler registered")
-		c.logErr("No handler registered for event type: %s", event.Type)
-		c.metrics.recordError(err)
-
-		if c.config.EnableDLQ {
-			c.sendToDLQ(event, err, 0, msg.Value)
-		}
+	if len(handlers) == 0 {
+		c.logInfo("Skipping event %s: no handler registered", event.Type)
+		c.metrics.recordSuccess(startTime)
 		c.commitIfManual(ctx, msg)
 		return
 	}
 
-	var lastErr error
-	var retry bool
+	for _, handler := range handlers {
+		if err := c.executeHandler(ctx, event, handler); err != nil {
+			c.metrics.recordError(err)
 
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		if attempt > 0 {
-			atomic.AddInt64(&c.metrics.MessagesRetried, 1)
-			c.logInfo("Retrying event %s (attempt %d/%d)", event.Type, attempt, c.config.MaxRetries)
-
-			backoff := time.Duration(attempt*attempt) * time.Second
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return
-			case <-c.shutdownCh:
-				return
+			if c.config.EnableDLQ {
+				c.sendToDLQ(event, err, c.config.MaxRetries+1, msg.Value)
 			}
-		}
 
-		retry, lastErr = handler(event.Data)
-		if lastErr == nil {
-			c.logInfo("Successfully processed event: %s", event.Type)
-			c.metrics.recordSuccess(startTime)
 			c.commitIfManual(ctx, msg)
 			return
 		}
+	}
 
-		c.logErr("Handler failed for event %s (attempt %d): %v", event.Type, attempt+1, lastErr)
-		c.metrics.recordError(lastErr)
+	c.logInfo(
+		"Successfully processed event %s with %d handler(s)",
+		event.Type,
+		len(handlers),
+	)
+
+	c.metrics.recordSuccess(startTime)
+	c.commitIfManual(ctx, msg)
+}
+
+func (c *KafkaConsumer) executeHandler(
+	ctx context.Context,
+	event Event,
+	handler EventHandler,
+) error {
+
+	var lastErr error
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+
+		if attempt > 0 {
+			atomic.AddInt64(&c.metrics.MessagesRetried, 1)
+
+			c.logInfo(
+				"Retrying event %s (attempt %d/%d)",
+				event.Type,
+				attempt,
+				c.config.MaxRetries,
+			)
+
+			backoff := time.Duration(attempt*attempt) * time.Second
+
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.shutdownCh:
+				return context.Canceled
+			}
+		}
+
+		retry, err := handler(event.Data)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		c.logErr(
+			"Handler failed for event %s (attempt %d): %v",
+			event.Type,
+			attempt+1,
+			err,
+		)
 
 		if !retry {
-			c.logInfo("Handler indicated no retry for event %s", event.Type)
 			break
 		}
 	}
 
-	c.logErr("Handler failed after %d retries for event %s: %v",
-		c.config.MaxRetries, event.Type, lastErr)
-
-	c.metrics.recordError(lastErr)
-
-	if c.config.EnableDLQ {
-		c.sendToDLQ(event, lastErr, c.config.MaxRetries+1, msg.Value)
-	}
-
-	// Commit even on terminal failure (when ManualCommit) so a poison
-	// message that's already been DLQ'd doesn't block the partition
-	// forever. If EnableDLQ is false, you may prefer NOT to commit here
-	// so the message can be retried after a redeploy -- adjust to taste.
-	c.commitIfManual(ctx, msg)
+	return lastErr
 }
 
 // commitIfManual commits the offset when ManualCommit is enabled. When
