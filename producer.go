@@ -18,8 +18,8 @@ import (
 // (e.g. emitting analytics events from a hot path) -- plus a way to
 // guarantee the latter actually landed before shutdown.
 type Producer interface {
-	// Produce publishes an event synchronously, using eventType as the
-	// partition key, and blocks until the broker acks or ctx is done.
+	// Produce publishes an event synchronously
+	// and blocks until the broker acks or ctx is done.
 	Produce(ctx context.Context, eventType string, data interface{}) error
 
 	// ProduceKey is like Produce but with an explicit partition key.

@@ -174,7 +174,24 @@ func NewKafkaProducer(cfg ProducerConfig) (*KafkaProducer, error) {
 // ============== PUBLIC METHODS ==============
 
 func (p *KafkaProducer) Produce(ctx context.Context, eventType string, data interface{}) error {
-	return p.ProduceKey(ctx, eventType, eventType, data)
+	if p.closed.Load() {
+		return ErrProducerClosed
+	}
+
+	payload, err := marshalEvent(eventType, data)
+	if err != nil {
+		return fmt.Errorf("messaging: marshal event %q: %w", eventType, err)
+	}
+
+	if err := p.publish(ctx, "", eventType, payload); err != nil {
+		p.metrics.recordError(err)
+		p.logErr("Failed to produce event %s: %v", eventType, err)
+		return err
+	}
+
+	p.metrics.recordSuccess()
+	p.logInfo("Produced event %s with empty key", eventType)
+	return nil
 }
 
 func (p *KafkaProducer) ProduceKey(ctx context.Context, key string, eventType string, data interface{}) error {
