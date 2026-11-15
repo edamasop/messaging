@@ -3,11 +3,21 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
+
+// ErrConsumerClosed is reported when the consumer stops accepting work, for
+// example while the fetch loop is handing a message to a partition worker.
+var ErrConsumerClosed = errors.New("messaging: consumer is closed")
+
+// errConsumerStopping aborts a retry loop during shutdown. It is deliberately
+// not treated as a handler failure: the message stays uncommitted and is
+// redelivered later instead of being parked in the DLQ.
+var errConsumerStopping = errors.New("messaging: consumer is stopping")
 
 // Consumer defines the behavioral contract for an asynchronous message consumer.
 // It supports event-driven registration, lifecycle control (start, close, pause, resume),

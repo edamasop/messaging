@@ -132,7 +132,9 @@ func NewKafkaProducer(cfg ProducerConfig) (*KafkaProducer, error) {
 	}
 
 	w := &kafka.Writer{
-		Addr: kafka.TCP(cfg.BootstrapServers),
+		// splitServers is mandatory: kafka.TCP() takes one address per broker,
+		// while BootstrapServers is a single comma-separated string.
+		Addr: kafka.TCP(splitServers(cfg.BootstrapServers)...),
 		// Topic is intentionally left unset on the writer: per-message
 		// Topic (set in publish()) is required to make TopicRouter work,
 		// and kafka-go disallows setting both Writer.Topic and

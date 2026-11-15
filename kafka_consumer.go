@@ -37,6 +37,21 @@ type ConsumerConfig struct {
 	// If false, the offset is committed immediately after the message
 	// is fetched (at-most-once-ish, but simple).
 	ManualCommit bool
+	// StartOffset selects where a consumer group with no committed offsets
+	// begins: kafka.FirstOffset replays the whole topic, kafka.LastOffset
+	// only sees messages published from now on. Defaults to FirstOffset so
+	// a fresh local setup still replays history.
+	StartOffset int64
+	// ProcessingWorkers is the number of partition workers. Every partition
+	// is pinned to exactly one worker, so per-partition ordering is kept
+	// while different partitions are handled concurrently. A handler that
+	// is slow on one partition therefore no longer stalls the others.
+	// Defaults to 4, capped at 64.
+	ProcessingWorkers int
+	// PartitionBufferSize bounds each worker's queue. When a queue fills up,
+	// fetching blocks: that is deliberate backpressure towards Kafka instead
+	// of unbounded in-memory growth. Defaults to 64.
+	PartitionBufferSize int
 	// Dead Letter Queue configuration
 	EnableDLQ  bool
 	DLQTopic   string
@@ -82,6 +97,12 @@ type KafkaConsumer struct {
 	pauseMu    sync.Mutex
 	paused     bool
 	resumeChan chan struct{}
+
+	// workCh holds one queue per partition worker. The fetch loop in Start()
+	// is the only writer (and the only closer), workers are the readers, so
+	// no extra locking is needed for the slice itself.
+	workCh   []chan kafka.Message
+	workerWG sync.WaitGroup
 }
 
 // ============== CONSTRUCTOR ==============
@@ -114,6 +135,18 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 	if cfg.HealthFailureWindow <= 0 {
 		cfg.HealthFailureWindow = time.Minute
 	}
+	if cfg.StartOffset == 0 {
+		cfg.StartOffset = kafka.FirstOffset
+	}
+	if cfg.ProcessingWorkers <= 0 {
+		cfg.ProcessingWorkers = 4
+	}
+	if cfg.ProcessingWorkers > 64 {
+		cfg.ProcessingWorkers = 64
+	}
+	if cfg.PartitionBufferSize <= 0 {
+		cfg.PartitionBufferSize = 64
+	}
 
 	if cfg.EnableDLQ && cfg.DLQTopic == "" {
 		return nil, errors.New("DLQ topic must be specified when EnableDLQ is true")
@@ -129,18 +162,19 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 	}
 
 	readerCfg := kafka.ReaderConfig{
-		Brokers:     []string{cfg.BootstrapServers},
+		// splitServers is required here: BootstrapServers is a comma-separated
+		// list, and handing "a:9092,b:9092" to kafka-go as a single address
+		// would make the consumer dial a host that does not exist.
+		Brokers:     splitServers(cfg.BootstrapServers),
 		GroupID:     cfg.GroupID,
 		GroupTopics: cfg.Topics,
-		StartOffset: kafka.FirstOffset,
+		StartOffset: cfg.StartOffset,
 		MaxWait:     cfg.ReadTimeout,
 		// NOTE: CommitInterval is only meaningful for the reader's own
 		// background auto-commit. When ManualCommit is true we call
 		// CommitMessages explicitly and this is effectively unused;
-		// when ManualCommit is false we commit synchronously right
-		// after FetchMessage (see processMessage), so this is also
-		// unused in that path. Left here in case callers rely on
-		// kafka-go's reader directly elsewhere.
+		// when ManualCommit is false Start() commits synchronously right
+		// after FetchMessage, so it is unused there as well.
 		CommitInterval: cfg.CommitInterval,
 	}
 
@@ -150,6 +184,13 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// One queue per partition worker. Buffered so a burst of already-fetched
+	// messages does not immediately block the fetch loop.
+	workCh := make([]chan kafka.Message, cfg.ProcessingWorkers)
+	for i := range workCh {
+		workCh[i] = make(chan kafka.Message, cfg.PartitionBufferSize)
+	}
 
 	return &KafkaConsumer{
 		config:     cfg,
@@ -161,6 +202,7 @@ func NewKafkaConsumer(cfg ConsumerConfig) (*KafkaConsumer, error) {
 		metrics:    &ConsumerMetrics{LastMessageTime: time.Now()},
 		ctx:        ctx,
 		cancel:     cancel,
+		workCh:     workCh,
 		// Initialize resumeChan up front (closed channels are valid to
 		// select on repeatedly only once; an *unstarted* paused state
 		// never happens here since paused starts false, so this is just
@@ -188,7 +230,11 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	c.wg.Add(1)
 	defer c.wg.Done()
 
-	c.logInfo("Consumer started. Subscribed to: %v", c.config.Topics)
+	c.logInfo(
+		"Consumer started. Subscribed to: %v, partition workers: %d",
+		c.config.Topics,
+		len(c.workCh),
+	)
 
 	c.metrics.mu.Lock()
 	c.metrics.StartTime = time.Now()
@@ -197,6 +243,23 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 	healthCtx, healthCancel := context.WithCancel(ctx)
 	defer healthCancel()
 	go c.healthCheckLoop(healthCtx)
+
+	for i := range c.workCh {
+		c.workerWG.Add(1)
+		go c.partitionWorker(i, c.workCh[i])
+	}
+
+	// Start() is the only producer on the work channels and therefore the
+	// only goroutine allowed to close them: no send/close race is possible.
+	// Draining before returning means a graceful shutdown still commits the
+	// messages that were already fetched.
+	defer func() {
+		for _, ch := range c.workCh {
+			close(ch)
+		}
+		c.workerWG.Wait()
+		c.logInfo("Partition workers stopped")
+	}()
 
 	for {
 		// Snapshot pause state + the channel to wait on under the lock,
@@ -254,8 +317,62 @@ func (c *KafkaConsumer) Start(ctx context.Context) {
 			}
 		}
 
-		c.processMessage(ctx, msg)
+		// Without manual commit we deliberately keep the old "at most once"
+		// contract: the offset advances as soon as the message is fetched,
+		// not when it has been handled.
+		if !c.config.ManualCommit {
+			c.commitMessage(msg)
+		}
+
+		if err := c.dispatch(ctx, msg); err != nil {
+			c.logInfo("Stopped dispatching messages: %v", err)
+			return
+		}
 	}
+}
+
+// dispatch hands a message to the worker that owns its partition. It blocks
+// while that worker's queue is full, which is the intended backpressure: we
+// stop fetching instead of buffering an unbounded amount of work in memory.
+func (c *KafkaConsumer) dispatch(ctx context.Context, msg kafka.Message) error {
+	idx := partitionWorkerIndex(msg.Partition, len(c.workCh))
+
+	select {
+	case c.workCh[idx] <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.shutdownCh:
+		return ErrConsumerClosed
+	}
+}
+
+// partitionWorker processes messages of its partition strictly one by one,
+// which preserves per-partition ordering (Kafka only guarantees ordering
+// inside a partition, so no stronger guarantee is possible or needed).
+func (c *KafkaConsumer) partitionWorker(id int, ch <-chan kafka.Message) {
+	defer c.workerWG.Done()
+
+	c.logInfo("Partition worker %d started", id)
+
+	for msg := range ch {
+		// The worker context is intentionally not the Start() context: on a
+		// graceful stop we want to finish what was already fetched. A hard
+		// shutdown still aborts retries through shutdownCh.
+		c.processMessage(context.Background(), msg)
+	}
+
+	c.logInfo("Partition worker %d stopped", id)
+}
+
+// partitionWorkerIndex pins a partition to a worker. The modulo mapping is
+// what keeps ordering intact: the same partition always lands on the same
+// worker and is therefore never processed by two goroutines at once.
+func partitionWorkerIndex(partition int, workers int) int {
+	if workers <= 1 || partition < 0 {
+		return 0
+	}
+	return partition % workers
 }
 
 func (c *KafkaConsumer) Close() error {
@@ -380,7 +497,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 			c.sendToDLQ(rawEventFallback(msg.Value), err, 0, msg.Value)
 		}
 
-		c.commitIfManual(ctx, msg)
+		c.commitAfterProcessing(msg)
 		return
 	}
 
@@ -391,19 +508,30 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	if len(handlers) == 0 {
 		c.logInfo("Skipping event %s: no handler registered", event.Type)
 		c.metrics.recordSuccess(startTime)
-		c.commitIfManual(ctx, msg)
+		c.commitAfterProcessing(msg)
 		return
 	}
 
 	for _, handler := range handlers {
 		if err := c.executeHandler(ctx, event, handler); err != nil {
+			// A shutdown in the middle of a retry is not a failure of the
+			// event: leave the offset uncommitted so the message is redelivered
+			// to the next instance instead of being parked in the DLQ.
+			if errors.Is(err, errConsumerStopping) {
+				c.logInfo(
+					"Consumer stopping; leaving event %s (topic=%s partition=%d offset=%d) uncommitted for redelivery",
+					event.Type, msg.Topic, msg.Partition, msg.Offset,
+				)
+				return
+			}
+
 			c.metrics.recordError(err)
 
 			if c.config.EnableDLQ {
 				c.sendToDLQ(event, err, c.config.MaxRetries+1, msg.Value)
 			}
 
-			c.commitIfManual(ctx, msg)
+			c.commitAfterProcessing(msg)
 			return
 		}
 	}
@@ -415,7 +543,7 @@ func (c *KafkaConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 	)
 
 	c.metrics.recordSuccess(startTime)
-	c.commitIfManual(ctx, msg)
+	c.commitAfterProcessing(msg)
 }
 
 func (c *KafkaConsumer) executeHandler(
@@ -443,9 +571,9 @@ func (c *KafkaConsumer) executeHandler(
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				return ctx.Err()
+				return errConsumerStopping
 			case <-c.shutdownCh:
-				return context.Canceled
+				return errConsumerStopping
 			}
 		}
 
@@ -471,21 +599,27 @@ func (c *KafkaConsumer) executeHandler(
 	return lastErr
 }
 
-// commitIfManual commits the offset when ManualCommit is enabled. When
-// ManualCommit is false, the offset was already committed implicitly by
-// FetchMessage's caller -- actually no: FetchMessage never auto-commits,
-// so in the non-manual mode we commit immediately here too, right after
-// fetch is too early (before processing) -- instead we commit right away
-// in the non-manual branch below in Start() is wrong too. To keep
-// semantics simple and correct: non-manual mode commits immediately after
-// a successful FetchMessage, manual mode commits only after the outcome
-// above is known.
-func (c *KafkaConsumer) commitIfManual(ctx context.Context, msg kafka.Message) {
+// commitAfterProcessing commits the offset once the handler outcome is known.
+// It is a no-op without manual commit, where the offset has already been
+// committed right after the fetch (see Start).
+func (c *KafkaConsumer) commitAfterProcessing(msg kafka.Message) {
 	if !c.config.ManualCommit {
 		return
 	}
+
+	c.commitMessage(msg)
+}
+
+// commitMessage commits a single offset. A dedicated timeout is used instead
+// of the caller's context so that an in-flight message can still be committed
+// while the service is shutting down.
+func (c *KafkaConsumer) commitMessage(msg kafka.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	if err := c.consumer.CommitMessages(ctx, msg); err != nil {
-		c.logErr("Failed to commit offset: %v", err)
+		c.logErr("Failed to commit offset (topic=%s partition=%d offset=%d): %v",
+			msg.Topic, msg.Partition, msg.Offset, err)
 		c.metrics.recordError(err)
 	}
 }
@@ -508,7 +642,7 @@ func (c *KafkaConsumer) sendToDLQ(event Event, err error, attempts int, raw []by
 
 	if c.dlqWriter == nil {
 		c.dlqWriter = &kafka.Writer{
-			Addr:     kafka.TCP(c.config.BootstrapServers),
+			Addr:     kafka.TCP(splitServers(c.config.BootstrapServers)...),
 			Topic:    c.config.DLQTopic,
 			Balancer: &kafka.LeastBytes{},
 		}
